@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - '**'
+  pull_request: {}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: set up python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - uses: actions/cache@v3
+        id: cache
+        with:
+          path: ${{ env.pythonLocation }}
+          key: >
+            lint
+            ${{ runner.os }}
+            ${{ env.pythonLocation }}
+            ${{ hashFiles('requirements/linting.txt') }}
+
+      - name: install
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: pip install -r requirements/linting.txt
+
+      - uses: pre-commit/action@v3.0.0
+        with:
+          extra_args: --all-files --verbose
+
+  test:
+    name: test ${{ matrix.python-version }} on ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu, macos]
+        python-version: ['3.7', '3.8', '3.9', '3.10']
+        # test 3.11-dev and pypy on ubuntu only to speed up CI, no reason why macos X pypy should fail separately
+        include:
+          - os: 'ubuntu'
+            python-version: '3.11-dev'
+          - os: 'ubuntu'
+            python-version: 'pypy-3.7'
+          - os: 'ubuntu'
+            python-version: 'pypy-3.8'
+          - os: 'ubuntu'
+            python-version: 'pypy-3.9'
+
+    runs-on: ${{ matrix.os }}-latest
+
+    env:
+      PYTHON: ${{ matrix.python-version }}
+      OS: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: set up python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - uses: actions/cache@v3
+        id: cache
+        with:
+          path: ${{ env.pythonLocation }}
+          key: ${{ runner.os }}-${{ env.pythonLocation }}-${{ hashFiles('requirements/pyproject.txt') }}-${{ hashFiles('requirements/testing.txt') }}
+
+      - run: pip install -r requirements/pyproject.txt -r requirements/testing.txt
+        if: steps.cache.outputs.cache-hit != 'true'
+
+      - run: coverage run -m pytest
+
+      - run: coverage xml
+
+      - uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage.xml
+          env_vars: PYTHON,OS
+
+  docker-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - run: docker build . -t dnserver
+      - run: docker run --rm dnserver --help
+
+  deploy:
+    name: Deploy
+    needs: [lint, test, docker-build]
+    if: "success() && startsWith(github.ref, 'refs/tags/')"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v2
+
+      - uses: docker/setup-buildx-action@v2
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: samuelcolvin
+          password: ${{ secrets.dockerhub_token }}
+
+      - name: set up python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: install
+        run: pip install -U twine build packaging
+
+      - name: check version
+        id: check-version
+        run: python <(curl -Ls https://gist.githubusercontent.com/samuelcolvin/4e1ad439c5489e8d6478cdee3eb952ef/raw/check_version.py)
+        env:
+          VERSION_PATH: 'dnserver/version.py'
+
+      - name: build
+        run: python -m build
+
+      - run: twine check dist/*
+
+      - name: upload to pypi
+        run: twine upload dist/*
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.pypi_token }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v3
+        with:
+          push: true
+          tags: samuelcolvin/dnserver:latest,samuelcolvin/dnserver:v${{ steps.check-version.outputs.VERSION }}
